@@ -7,13 +7,13 @@ Photometry stays out so this is not a second copy of the supervised model.
 
 KMeans and a full-covariance Gaussian mixture each choose k on the HR
 diagram. A temperature-only clustering at that same k is the baseline.
-Adjusted Rand Index is not comparable across different values of k, so
-the baseline holds k fixed.
+The baseline holds k fixed to control the feature comparison. Adjusted
+Rand Index can also compare partitions with different numbers of groups.
 
 The comparison against spectraltype_esphs is Adjusted Rand Index plus a
-row-normalized contingency table. Temperature-only agreement should be
-higher: spectral type tracks temperature, while HR clusters also split
-stars of similar temperature by luminosity (dwarfs versus giants).
+row-normalized contingency table. Whether luminosity adds stable structure
+beyond temperature is a hypothesis. ARI differences alone do not establish
+giant/dwarf separation or validate physical populations.
 
 Usage:
     python src/unsupervised.py
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from itertools import combinations
 from pathlib import Path
+import warnings
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -46,7 +47,7 @@ SILHOUETTE_SAMPLE = 10_000
 # Among k values this close to the best silhouette, keep the smallest.
 SILHOUETTE_TOL = 0.01
 GMM_MAX_ITER = 200
-# Close in temperature and far in luminosity: a dwarf/giant split.
+# Similar median temperature and different median luminosity: exploratory hints.
 TEFF_SPLIT_DEX = 0.05
 LUM_SPLIT_DEX = 0.5
 # A cluster "contains" a spectral type when it holds at least this share of it.
@@ -119,7 +120,8 @@ def silhouette_index(n: int) -> np.ndarray:
 
 
 def safe_silhouette(X_sub: np.ndarray, labels_sub: np.ndarray) -> float:
-    if len(np.unique(labels_sub)) < 2:
+    n_labels = len(np.unique(labels_sub))
+    if not 2 <= n_labels < len(X_sub):
         return float("nan")
     return float(silhouette_score(X_sub, labels_sub))
 
@@ -135,8 +137,12 @@ def choose_k_silhouette(rows: list[dict]) -> int:
 
 
 def choose_k_bic(rows: list[dict]) -> int:
-    """Minimum BIC. Exact ties keep the smaller k."""
-    return int(min(rows, key=lambda row: (row["bic"], row["k"]))["k"])
+    """Minimum finite BIC among converged fits. Ties keep the smaller k."""
+    eligible = [row for row in rows
+                if row.get("converged", True) and np.isfinite(row["bic"])]
+    if not eligible:
+        raise RuntimeError("No converged GMM with finite BIC is available for selection.")
+    return int(min(eligible, key=lambda row: (row["bic"], row["k"]))["k"])
 
 
 def search_kmeans(X: np.ndarray, idx: np.ndarray) -> tuple[pd.DataFrame, int, np.ndarray]:
@@ -175,9 +181,9 @@ def search_gmm(X: np.ndarray) -> tuple[pd.DataFrame, int, np.ndarray]:
     """Fit a full-covariance mixture for every k. Choose k by minimum BIC.
 
     Full covariance lets a component tilt along the main sequence instead of
-    cutting that diagonal into round blobs. BIC penalizes extra components
-    more than AIC, which fits a question about a handful of populations.
-    Exact BIC ties keep the smaller k.
+    cutting that diagonal into round blobs. A density component need not be
+    a distinct physical population. Failed fits are recorded but excluded
+    from selection. Exact BIC ties keep the smaller k.
     """
     print("\n[uns] === GMM k search ===")
     rows: list[dict] = []
@@ -193,15 +199,24 @@ def search_gmm(X: np.ndarray) -> tuple[pd.DataFrame, int, np.ndarray]:
         )
         labels = model.fit_predict(X)
         bic = float(model.bic(X))
-        rows.append({"k": k, "bic": bic})
+        converged = bool(model.converged_)
+        rows.append({"k": k, "bic": bic, "converged": converged,
+                     "n_iter": int(model.n_iter_)})
         stored[k] = labels
-        print(f"[uns]   k={k}  bic={bic:.1f}  n_iter={model.n_iter_}")
-        if model.n_iter_ >= GMM_MAX_ITER:
-            print(f"[uns]   k={k} hit max_iter={GMM_MAX_ITER}")
+        print(f"[uns]   k={k}  bic={bic:.1f}  n_iter={model.n_iter_}  converged={converged}")
+        if not converged or not np.isfinite(bic):
+            warnings.warn(f"GMM k={k} excluded: nonconverged fit or nonfinite BIC.",
+                          RuntimeWarning, stacklevel=2)
 
     k_star = choose_k_bic(rows)
     chosen_bic = min(row["bic"] for row in rows if row["k"] == k_star)
-    print(f"[uns] selected k={k_star} (minimum BIC {chosen_bic:.1f})")
+    print(f"[uns] selected k={k_star} (minimum eligible BIC {chosen_bic:.1f} among tested k)")
+    if len(rows) > 1 and k_star == max(row["k"] for row in rows):
+        warnings.warn(
+            f"GMM selected k={k_star} at the upper search boundary; "
+            "this is the best tested k, not an established unrestricted optimum.",
+            RuntimeWarning, stacklevel=2,
+        )
     labels = stored.pop(k_star)
     del stored
     return pd.DataFrame(rows), k_star, labels
@@ -222,7 +237,10 @@ def fit_temperature_only(X_teff: np.ndarray, k: int, kind: str) -> np.ndarray:
         )
     else:
         raise ValueError(f"Unknown model kind: {kind}")
-    return model.fit_predict(X_teff)
+    labels = model.fit_predict(X_teff)
+    if kind == "gmm" and not model.converged_:
+        raise RuntimeError(f"Temperature-only GMM k={k} did not converge; ARI comparison aborted.")
+    return labels
 
 
 def relabel_hot_to_cool(
@@ -576,9 +594,9 @@ def print_hypothesis() -> None:
     print("[uns] temperature-only baseline: log10(teff_gspphot), same k and algorithm")
     print("[uns] label: spectraltype_esphs (comparison only, not a feature)")
     print(
-        "[uns] Hypothesis: temperature-only ARI should be higher than HR ARI, "
-        "and the HR contingency table should show later types (especially G, K, M) "
-        "split across clusters that share a temperature but differ in luminosity."
+        "[uns] Hypothesis to investigate: luminosity may separate stars of "
+        "similar temperature. ARI and whole-cluster median differences are "
+        "descriptive, not independent evidence of giant/dwarf populations."
     )
 
 
@@ -621,6 +639,8 @@ def main() -> None:
 
     kmeans_table, k_kmeans, labels_kmeans = search_kmeans(X_hr, idx)
     gmm_table, k_gmm, labels_gmm = search_gmm(X_hr)
+    kmeans_table.to_csv(FIG_DIR / "kmeans_selection.csv", index=False)
+    gmm_table.to_csv(FIG_DIR / "gmm_selection.csv", index=False)
 
     print("\n[uns] === temperature-only baselines ===")
     labels_kmeans_teff = fit_temperature_only(X_teff, k_kmeans, "kmeans")
@@ -643,6 +663,12 @@ def main() -> None:
     print("\n[uns] ARI recap (HR vs temperature-only):")
     print(f"[uns]   KMeans  {ari_kmeans_hr:.3f}  vs  {ari_kmeans_teff:.3f}")
     print(f"[uns]   GMM     {ari_gmm_hr:.3f}  vs  {ari_gmm_teff:.3f}")
+    pd.DataFrame([
+        {"model": "KMeans", "k": k_kmeans, "ari_hr": ari_kmeans_hr,
+         "ari_temperature_only": ari_kmeans_teff},
+        {"model": "GMM", "k": k_gmm, "ari_hr": ari_gmm_hr,
+         "ari_temperature_only": ari_gmm_teff},
+    ]).to_csv(FIG_DIR / "ari_summary.csv", index=False)
 
     plot_selection(
         kmeans_table,
